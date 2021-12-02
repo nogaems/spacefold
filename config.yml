@@ -1,0 +1,27 @@
+# note that there won't be any sort of validation performed on this file,
+# so editing it in a wrong way denotes panic
+
+# in order to preserve trailing spaces, explicitly quote it
+target_name: "USB OPTICAL MOUSE "
+virtual_manipulator_prefix: Virtual Manipulator
+virtual_mouse_prefix: Virtual Mouse
+
+# the list of events to be propagated
+virtual_mouse_keys:
+  - BTN_LEFT
+  - BTN_MIDDLE
+  - BTN_RIGHT
+virtual_mouse_axes:
+  - REL_X
+  - REL_Y
+  - REL_WHEEL
+
+# the sequence of events that triggers switching of the mode
+toggle_sequence:
+  - [BTN_RIGHT, 1]
+  - [BTN_LEFT, 1]
+  - [BTN_RIGHT, 0]
+  - [BTN_LEFT, 0]
+
+# available values: Mouse, Manipulator
+default_mode: Mouse
