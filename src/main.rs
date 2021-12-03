@@ -5,8 +5,14 @@ use evdev::{
     AttributeSet, InputEvent, InputEventKind, Key, RelativeAxisType,
 };
 use serde::Deserialize;
-use serde_yaml;
-use std::{ops::RangeBounds, str::FromStr};
+use std::collections::VecDeque;
+use std::str::FromStr;
+
+#[derive(Debug, PartialEq)]
+struct Keystroke {
+    key: u16,
+    value: i32,
+}
 
 #[derive(Debug, PartialEq, Deserialize, Copy, Clone)]
 enum Mode {
@@ -21,8 +27,20 @@ struct Config {
     virtual_mouse_prefix: String,
     virtual_mouse_keys: Vec<String>,
     virtual_mouse_axes: Vec<String>,
-    toggle_sequence: Vec<(String, u8)>,
+    toggle_sequence: Vec<(String, u16)>,
     default_mode: Mode,
+}
+
+impl Config {
+    fn toggle_sequence_to_keystrokes(&self) -> Vec<Keystroke> {
+        self.toggle_sequence
+            .iter()
+            .map(|(k, v)| Keystroke {
+                key: Key::from_str(k).unwrap().0,
+                value: *v as i32,
+            })
+            .collect()
+    }
 }
 
 struct VirtualDeviceConfig {
@@ -32,7 +50,7 @@ struct VirtualDeviceConfig {
 }
 
 impl VirtualDeviceConfig {
-    fn new(name: String, keys: &Vec<String>, axes: &Vec<String>) -> Result<Self, anyhow::Error> {
+    fn new(name: String, keys: &[String], axes: &[String]) -> Result<Self, anyhow::Error> {
         let keys = VirtualDeviceConfig::prepare_keys(keys)?;
         let axes = VirtualDeviceConfig::prepare_axes(axes)?;
 
@@ -42,7 +60,7 @@ impl VirtualDeviceConfig {
     // TODO: open an issue on evdev_rs repo::
     // evdev::attribute_set::ArrayedEvdevEnum is private so I can't use it in
     // a trait bound and make these functions generic
-    fn prepare_keys(list: &Vec<String>) -> Result<AttributeSet<Key>, anyhow::Error> {
+    fn prepare_keys(list: &[String]) -> Result<AttributeSet<Key>, anyhow::Error> {
         let mut result = AttributeSet::<Key>::new();
         for item in list.iter() {
             if let Ok(converted) = Key::from_str(item) {
@@ -53,7 +71,7 @@ impl VirtualDeviceConfig {
         }
         Ok(result)
     }
-    fn prepare_axes(list: &Vec<String>) -> Result<AttributeSet<RelativeAxisType>, anyhow::Error> {
+    fn prepare_axes(list: &[String]) -> Result<AttributeSet<RelativeAxisType>, anyhow::Error> {
         let mut result = AttributeSet::<RelativeAxisType>::new();
         for item in list.iter() {
             if let Ok(converted) = RelativeAxisType::from_str(item) {
@@ -66,6 +84,10 @@ impl VirtualDeviceConfig {
     }
 }
 
+// We need this because evdev library has no trait From<Key>/trait From<RelativeAxisType> for String,
+// so we have to store AttributeSet representation of it along with the  device.
+// Another reason to do that is because for some reason virtual devices
+// don't provide device.supported_*() methods.
 struct VirtualDeviceWrapper {
     device: VirtualDevice,
     config: VirtualDeviceConfig,
@@ -93,8 +115,8 @@ fn create_virtual_device(
 
     let device = VirtualDeviceBuilder::new()?
         .name(&name)
-        .with_keys(&keys)?
-        .with_relative_axes(&axes)?
+        .with_keys(keys)?
+        .with_relative_axes(axes)?
         .build()?;
     Ok(device)
 }
@@ -141,8 +163,8 @@ fn setup(
     ))
 }
 
-fn should_emit(device: &VirtualDeviceWrapper, event: &InputEvent, mode: Mode) -> bool {
-    if mode == Mode::Manipulator {
+fn should_emit(device: &VirtualDeviceWrapper, event: &InputEvent, mode: &Mode) -> bool {
+    if *mode == Mode::Manipulator {
         return true;
     }
     match event.kind() {
@@ -152,28 +174,81 @@ fn should_emit(device: &VirtualDeviceWrapper, event: &InputEvent, mode: Mode) ->
     }
 }
 
+fn should_toggle(history: &VecDeque<Keystroke>, sequence: &[Keystroke]) -> bool {
+    if history.len() != sequence.len() {
+        return false;
+    }
+    for (a, b) in history.iter().zip(sequence.iter()) {
+        if a != b {
+            return false;
+        }
+    }
+    true
+}
+
+fn save_stroke(history: &mut VecDeque<Keystroke>, event: &InputEvent, max_len: usize) -> bool {
+    if history.len() == max_len {
+        // we don't really need that value and just want to get a free slot
+        let _ = history.pop_front();
+    }
+    match event.kind() {
+        InputEventKind::Key(_) => {
+            history.push_back(Keystroke {
+                key: event.code(),
+                value: event.value(),
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config =
         serde_yaml::from_str(include_str!("../config.yml")).context("config.yml is malformed")?;
     let device = find_device(&config.target_name)?;
-    println!("{:#?}", device);
+    println!("target device configuration: {:#?}", device);
 
     let (mut target_device, mut virtual_manipulator_device, mut virtual_mouse_device) =
         setup(&config).context("failed to create virtual devices")?;
 
     let mut mode = config.default_mode;
 
+    let toggle_sequence = config.toggle_sequence_to_keystrokes();
+    let history_max_len: usize = toggle_sequence.len();
+    let mut history: VecDeque<Keystroke> = VecDeque::new();
+
+    //    let history = ringbuf::RingBuffer::<Keystroke>::new(toggle_sequence.len());
+    //    let (mut history_producer, mut history_consumer) = history.split();
+
     loop {
         let output_device = match mode {
-            Mode::Manipulator => &virtual_manipulator_device,
-            Mode::Mouse => &virtual_mouse_device,
+            Mode::Manipulator => &mut virtual_manipulator_device,
+            Mode::Mouse => &mut virtual_mouse_device,
         };
         let events = target_device
             .fetch_events()
             .context("failed to fetch events")?;
         for event in events {
-            if should_emit(output_device, &event, mode) {
-                println!("{:#?}", event);
+            let stroke_saved = save_stroke(&mut history, &event, history_max_len);
+            if should_emit(output_device, &event, &mode) {
+                println!("emitting event: {:#?}", event);
+                let _ = output_device
+                    .device
+                    .emit(&[event])
+                    .context("failed to emit an event")?;
+            }
+            if stroke_saved && should_toggle(&history, &toggle_sequence) {
+                mode = match mode {
+                    Mode::Mouse => {
+                        println!("mouse mode is switching to manipulator");
+                        Mode::Manipulator
+                    }
+                    Mode::Manipulator => {
+                        println!("manipulator mode is switching to mouse");
+                        Mode::Mouse
+                    }
+                };
             }
         }
     }
